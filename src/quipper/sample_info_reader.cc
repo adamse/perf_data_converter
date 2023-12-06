@@ -225,6 +225,93 @@ bool ReadBranchStack(DataReader* reader, struct perf_sample* sample) {
   return true;
 }
 
+// Reads user sample regs info from perf data. Corresponds to sample format
+// type PERF_SAMPLE_REGS_USER. Returns true when user sample regs data is
+// read completely. Otherwise, returns false.
+bool ReadSampleRegsUser(DataReader* reader,
+                        const struct perf_event_attr& attr,
+                        struct perf_sample* sample) {
+  // Make sure there is no existing allocated memory in |sample->user_regs|.
+  CHECK_EQ(static_cast<void*>(NULL), sample->user_regs);
+
+  // abi can only be 0, 1, or 2.
+  uint64_t abi = 3;
+  if (!reader->ReadUint64(&abi) || abi > 2) {
+    LOG(ERROR) << "Failed to read the abi.";
+    return false;
+  }
+
+  // If abi is 0, there's no regs recorded. Refer to perf_sample_regs_user() and
+  // perf_output_sample() in kernel/events/core.c.
+  if (abi == 0) {
+    return true;
+  }
+
+  std::bitset<64> b(attr.sample_regs_user);
+  size_t regs_size = b.count();
+
+  sample->user_regs =
+      reinterpret_cast<struct regs_dump*>(new uint64_t[regs_size + 1]);
+  sample->user_regs->abi = abi;
+
+  for (size_t i = 0; i < regs_size; ++i) {
+        if (!reader->ReadUint64(&sample->user_regs->regs[i])) {
+          LOG(ERROR) << "Failed to read the cpu registers: " << i << " " << regs_size;
+          return false;
+        }
+  }
+
+  return true;
+}
+
+// Reads user sample stack info from perf data. Corresponds to sample format
+// type PERF_SAMPLE_STACK_USER. Returns true when user sample stack data is
+// read completely. Otherwise, returns false.
+bool ReadSampleStackUser(DataReader* reader,
+                        const struct perf_event_attr& attr,
+                        struct perf_sample* sample) {
+  // Save the original read offset.
+  size_t reader_offset = reader->Tell();
+
+  uint64_t size = 0;
+  if (!reader->ReadUint64(&size)) {
+    LOG(ERROR) << "Failed to read the stack size.";
+    return false;
+  }
+  sample->user_stack.size = size;
+  if (sample->user_stack.size == 0) {
+    return true;
+  }
+
+  // Allocate space for and read the raw data bytes.
+  sample->user_stack.data = new uint8_t[sample->user_stack.size];
+  if (!reader->ReadData(sample->user_stack.size, sample->user_stack.data)) {
+      LOG(ERROR) << "Failed to read the stack data.";
+      return false;
+  }
+
+  sample->user_stack.dyn_size = new u64;
+  if (!reader->ReadUint64(sample->user_stack.dyn_size)) {
+    LOG(ERROR) << "Failed to read the dynamic size.";
+    return false;
+  }
+
+  if (*sample->user_stack.dyn_size > sample->user_stack.size) {
+    LOG(ERROR)
+        << "Dynamic size " << *sample->user_stack.dyn_size
+        << " cannot exceed the size of " << sample->user_stack.size;
+    return false;
+  }
+
+  // Determine the bytes that were read, and align to the next 64 bits.
+  reader_offset += Align<uint64_t>(sizeof(sample->user_stack.size) +
+                                   sample->user_stack.size +
+                                   sizeof(sample->user_stack.dyn_size));
+  if (!reader->SeekSet(reader_offset)) return false;
+
+  return true;
+}
+
 // Reads perf sample info data from |event| into |sample|.
 // |attr| is the event attribute struct, which contains info such as which
 // sample info fields are present.
@@ -399,16 +486,21 @@ bool ReadPerfSampleFromData(const event_t& event,
   // { u64                   abi; # enum perf_sample_regs_abi
   //   u64                   regs[weight(mask)]; } && PERF_SAMPLE_REGS_USER
   if (sample_fields & PERF_SAMPLE_REGS_USER) {
-    LOG(ERROR) << "PERF_SAMPLE_REGS_USER is not yet supported.";
-    return false;
+    if (!ReadSampleRegsUser(&reader, attr, sample)) {
+      LOG(ERROR) << "Couldn't read PERF_SAMPLE_REGS_USER";
+      return false;
+    }
   }
 
   // { u64                   size;
   //   char                  data[size];
   //   u64                   dyn_size; } && PERF_SAMPLE_STACK_USER
   if (sample_fields & PERF_SAMPLE_STACK_USER) {
-    LOG(ERROR) << "PERF_SAMPLE_STACK_USER is not yet supported.";
-    return false;
+    //if (!ReadSampleStackUser(&reader, sample)) {
+    if (!ReadSampleStackUser(&reader, attr, sample)) {
+      LOG(ERROR) << "Couldn't read PERF_SAMPLE_STACK_USER";
+      return false;
+    }
   }
 
   /*
